@@ -125,19 +125,36 @@ class ImageLabel(QtWidgets.QLabel):
             
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        
+
         # Add actions
         copy_path = QAction("Copy Image Path", self)
         copy_path.triggered.connect(lambda: pyperclip.copy(self.image_path if self.image_path else ""))
-        
+
         reset_zoom = QAction("Reset Zoom", self)
         reset_zoom.triggered.connect(self.reset_zoom)
-        
+
+        upload_image = QAction("Upload Image", self)
+        upload_image.triggered.connect(self.upload_image)
+
         menu.addAction(copy_path)
         menu.addAction(reset_zoom)
-        
+        menu.addAction(upload_image)
+
         # Show menu at cursor position
         menu.exec_(event.globalPos())
+
+    def upload_image(self):
+        from PyQt5.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)")
+        if file_path:
+            self.set_image_path(file_path)
+            # Find the parent ScreenshotAnalyzer and update its image_path
+            parent = self.parent()
+            while parent is not None and not hasattr(parent, 'display_image'):
+                parent = parent.parent()
+            if parent is not None:
+                parent.image_path = file_path
+                parent.display_image()
         
     def reset_zoom(self):
         self.zoom_factor = 1.0
@@ -275,33 +292,37 @@ class ScreenshotAnalyzer(QMainWindow, Ui_MainWindow):
         
         self.entry = QtWidgets.QLineEdit()
         entryFont = self.entry.font()
-        entryFont.setPointSize(entryFont.pointSize() + 2)
+        entryFont.setPointSize(11)  # Standard, readable font size
         self.entry.setFont(entryFont)
         self.entry.setPlaceholderText("Ask about the image...")
-        # Ensure entry field is not cut off
-        self.entry.setMinimumHeight(38)
-        self.entry.setContentsMargins(0, 0, 0, 0)  # Internal padding
-        
+        self.entry.setMinimumHeight(30)
+        self.entry.setStyleSheet("""
+            padding-top: 4px;
+            padding-bottom: 4px;
+            font-size: 11pt;
+            border-radius: 8px;
+        """)
+        inputLayout.addWidget(self.entry, 1)  # Stretch factor 1: input fills all available space
+        self.entry.setContentsMargins(0, 0, 0, 0)
+
         self.send_button = QPushButton("Send")
         sendFont = self.send_button.font()
         sendFont.setPointSize(sendFont.pointSize() + 1)
         self.send_button.setFont(sendFont)
-        self.send_button.setMinimumHeight(38)
-        
+        self.send_button.setMinimumHeight(32)
+        inputLayout.addWidget(self.send_button, 0)
+
         self.loading_label = QLabel("")
-        self.loading_label.setMinimumWidth(30)  # Fixed width for loading indicator
-        
+        self.loading_label.setMinimumWidth(30)
+        inputLayout.addWidget(self.loading_label, 0)
+
         self.reset_memory = QPushButton("Reset")
         resetFont = self.reset_memory.font()
         resetFont.setPointSize(resetFont.pointSize() + 1)
         self.reset_memory.setFont(resetFont)
-        self.reset_memory.setMinimumHeight(38)
+        self.reset_memory.setMinimumHeight(32)
         self.reset_memory.setStyleSheet("background-color: #733e3e;")
-        
-        inputLayout.addWidget(self.entry, 1)
-        inputLayout.addWidget(self.send_button)
-        inputLayout.addWidget(self.loading_label)
-        inputLayout.addWidget(self.reset_memory)
+        inputLayout.addWidget(self.reset_memory, 0)
         
         # Add adequate spacing before input layout to prevent cut-off
         mainLayout.addSpacing(5)
@@ -427,14 +448,50 @@ class ScreenshotAnalyzer(QMainWindow, Ui_MainWindow):
         generator = Worker_Local(self.memory, self.LLM_API_MODEL, self.ollama_model_combo.currentText())
         generator.finished.connect(self.finished)
         generator.error.connect(self.show_error_message)
+        generator.partial.connect(self.stream_chunk)
+        # Buffer for streaming assistant output
+        self._streaming_ai_buffer = ""
+        self._streaming_last_ai_html = None
         generator.start()
         print("Worker started")
         self.worker_reference = generator
 
+    def stream_chunk(self, chunk):
+        import markdown
+        if not hasattr(self, '_streaming_ai_buffer'):
+            self._streaming_ai_buffer = ""
+        if not hasattr(self, '_assistant_label_shown'):
+            self._assistant_label_shown = False
+        self._streaming_ai_buffer += chunk
+        paragraphs = self._streaming_ai_buffer.split('\n\n')
+        for para in paragraphs[:-1]:
+            # Inject CSS for list padding to prevent number cut-off
+            css_padding = "<style>ol, ul { padding-left: 2em !important; }</style>"
+            if not self._assistant_label_shown:
+                html = (
+                    css_padding +
+                    "<div style='background-color: #333333; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
+                    "<b style='color: #6a9eda;'>ASSISTANT</b>: "
+                    f"<span style='color: #e0e0e0;'>{markdown.markdown(para)}</span></div>"
+                )
+                self._assistant_label_shown = True
+            else:
+                html = (
+                    css_padding +
+                    "<div style='background-color: #333333; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
+                    f"<span style='color: #e0e0e0;'>{markdown.markdown(para)}</span></div>"
+                )
+            self.conversation.append(html)
+            self._streaming_last_ai_block_number = self.conversation.document().blockCount() - 1
+        self._streaming_ai_buffer = paragraphs[-1]
+        self.conversation.ensureCursorVisible()
+
     def finished(self, response):
-        self.memory.append({'role': AI_ROLE, 'content': response})
+        import markdown
+        # On finish, flush any remaining buffer
         self.loading_label.setText("")
-        self.update_conversation(response, AI_ROLE)
+        self.memory.append({'role': AI_ROLE, 'content': response})
+        self.conversation.ensureCursorVisible()
 
     def show_message(self, message):
         message_box = QMessageBox()
@@ -454,17 +511,19 @@ class ScreenshotAnalyzer(QMainWindow, Ui_MainWindow):
         
     def update_conversation(self, text, role):
         markdown_text = markdown.markdown(text) if role == AI_ROLE else text
-        
+    
+        # Inject CSS for list padding to prevent number cut-off
+        css_padding = "<style>ol, ul { padding-left: 2em !important; }</style>"
         # Apply better styling to conversation messages
         if role == USER_ROLE:
-            self.conversation.append(f"<div style='background-color: #2d5c8a; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
+            self.conversation.append(css_padding + f"<div style='background-color: #2d5c8a; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
                                f"<b style='color: #ffffff;'>{role.upper()}</b>: "
                                f"<span style='color: #e0e0e0;'>{markdown_text}</span></div>")
         else:
-            self.conversation.append(f"<div style='background-color: #333333; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
+            self.conversation.append(css_padding + f"<div style='background-color: #333333; margin: 4px 0; padding: 8px; border-radius: 6px;'>"
                                f"<b style='color: #6a9eda;'>{role.upper()}</b>: "
                                f"<span style='color: #e0e0e0;'>{markdown_text}</span></div>")
-        
+    
         self.conversation.ensureCursorVisible()
 
     def image_to_base64(self):
